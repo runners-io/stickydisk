@@ -1,0 +1,86 @@
+# runners.io stickydisk (RUN-1745): a named disk that survives from run to run,
+# mounted at a path of your choosing. Up to five keys per job.
+#
+#     - uses: runners-io/stickydisk@v1
+#       with:
+#         key: ${{ github.repository }}-npm
+#         path: ~/.npm
+#
+# Each key is its own ext4 volume, scoped to the repository (and the runner
+# image), billed on the blocks you actually use at the sticky-disk rate and under
+# the same cap, reclaimed after seven idle days, and committed only by a trusted
+# successful run of the default branch: a pull request's build reads what the
+# default branch last kept and writes nothing back. The disk that is mounted for
+# you automatically, found through GHWARP_STICKY_DISK, is not replaced by this.
+#
+# WHAT HAPPENS THE FIRST TIME A KEY IS USED. The disks of a job are attached
+# before its first step runs, and the host cannot read your workflow to know
+# which keys you will ask for, so it attaches the keys your PREVIOUS run of the
+# same job asked for. A key seen for the first time is recorded and attached from
+# the next run: this step says so and the job runs without it (`device-state` is
+# `not-attached-yet`). The second run has an empty disk, the third a warm one.
+#
+# WHAT IT NEVER DOES. It never fails your job for want of a disk: a disk that was
+# refused (a fork's pull request, a tag, a protected repository's untrusted
+# build) or could not be attached says so in the log, with the true reason, and
+# the job runs cold. Set `fail-if-unavailable: true` to turn that into a failure.
+# On a runner that is not a runners.io Linux runner (a GitHub-hosted runner, a
+# Windows job) it changes nothing and says so in one notice, so a workflow that
+# also runs elsewhere can carry it unconditionally. A key outside the charset, a
+# missing or relative path, or a sixth distinct key in one job are mistakes in the
+# workflow, and fail the step before anything is touched.
+#
+# WHERE IT LIVES. The source is a directory in runners.io's private monorepo, and
+# an action in a private repository can be used only from inside it, so customers
+# use a PUBLIC copy: these files at the root of the repository on the line below,
+# tagged v1.x.y, with v1 moved to the newest (the precedent is runners-io/checkout,
+# published by hand). The copy is byte-identical to the source, and the monorepo's
+# verifier-self-tests.yml fails when it is not.
+#
+# Published as: runners-io/stickydisk
+#
+# Files: stickydisk.sh (what runs), self-test.sh (stickydisk.sh against a fake
+# manifest and fake mount tools, no network).
+name: runners.io stickydisk
+description: >-
+  Mount a named, persistent disk at a path on a runners.io runner. It keeps its
+  contents from run to run. Everywhere else it does nothing.
+author: runners.io
+
+inputs:
+  key:
+    description: >-
+      The disk's name: 1 to 128 characters of letters, digits and . _ : @ / + = -.
+      The same key in another repository is another disk.
+    required: true
+  path:
+    description: >-
+      Where to mount it. A leading ~ is your home directory; otherwise it must be
+      absolute. Created if it does not exist.
+    required: true
+  fail-if-unavailable:
+    description: >-
+      Fail the step when the disk is refused or cannot be attached, instead of
+      running without it.
+    required: false
+    default: 'false'
+
+outputs:
+  mounted:
+    description: '`true` when the disk is mounted at `path`, else `false`.'
+    value: ${{ steps.disk.outputs.mounted }}
+  device-state:
+    description: >-
+      `mounted`, `refused`, `unavailable`, `not-attached-yet` or `not-ours`.
+    value: ${{ steps.disk.outputs.device-state }}
+
+runs:
+  using: composite
+  steps:
+    - id: disk
+      shell: bash
+      env:
+        INPUT_KEY: ${{ inputs.key }}
+        INPUT_PATH: ${{ inputs.path }}
+        INPUT_FAIL_IF_UNAVAILABLE: ${{ inputs.fail-if-unavailable }}
+      run: '"${GITHUB_ACTION_PATH}/stickydisk.sh"'
