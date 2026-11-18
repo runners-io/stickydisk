@@ -86,7 +86,7 @@ done
 
 digest_of() { printf '%s' "$1" | { sha256sum 2>/dev/null || shasum -a 256; } | cut -c1-32; }
 
-# new_case <name>: a scratch tree with an /opt/ghwarp stand-in, a log, outputs.
+# new_case <name>: a scratch tree with an /opt/runnersio stand-in, a log, outputs.
 new_case() {
   case_dir="$work/$1"
   rm -rf "$case_dir"
@@ -169,8 +169,8 @@ eq "GitHub-hosted: nothing was run" "$logtxt" ""
 
 new_case nodir; P="$case_dir/mnt"; rm -rf "$case_dir/opt"
 run_action
-eq "no /opt/ghwarp at all: exit 0" "$rc" 0
-has "no /opt/ghwarp: not-ours" "$outtxt" "device-state=not-ours"
+eq "no /opt/runnersio at all: exit 0" "$rc" 0
+has "no /opt/runnersio: not-ours" "$outtxt" "device-state=not-ours"
 
 # --- 3. a key the host did not attach --------------------------------------------------
 new_case absent; P="$case_dir/mnt"

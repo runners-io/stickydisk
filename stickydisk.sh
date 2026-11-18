@@ -2,7 +2,7 @@
 # runners-io/stickydisk (RUN-1745): mount the keyed disk this job was given, or
 # say, truthfully, why it was not.
 #
-# WHAT IT READS. /opt/ghwarp/sticky-disks.json, which the guest's job-started
+# WHAT IT READS. /opt/runnersio/sticky-disks.json (/opt/ghwarp/ on an image older than RUN-4188), which the guest's job-started
 # hook (images/guest/ghwarp-bootstrap) writes, root-owned and mode 0644, before
 # the job's first step: one entry per keyed disk the host attached to this VM,
 #
@@ -34,7 +34,13 @@
 
 set -uo pipefail
 
-manifest="${GHWARP_STICKY_MANIFEST:-/opt/ghwarp/sticky-disks.json}"
+# RUN-4188: the guest's hook directory is /opt/runnersio now (the runner prints its hook's path in every customer's
+# job log). An image built before that still writes /opt/ghwarp, so a manifest at the old place is read when there is
+# none at the new one. GHWARP_STICKY_MANIFEST is the test suite's way of naming either.
+manifest="${GHWARP_STICKY_MANIFEST:-/opt/runnersio/sticky-disks.json}"
+if [ -z "${GHWARP_STICKY_MANIFEST:-}" ] && [ ! -e "$manifest" ] && [ -e /opt/ghwarp/sticky-disks.json ]; then
+  manifest=/opt/ghwarp/sticky-disks.json
+fi
 joblog_url_file="${GHWARP_JOBLOG_URL_FILE:-$(dirname "$manifest")/joblog-url}"
 
 out() { [ -z "${GITHUB_OUTPUT:-}" ] || printf '%s=%s\n' "$1" "$2" >>"$GITHUB_OUTPUT"; return 0; }

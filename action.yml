@@ -11,7 +11,7 @@
 # the same cap, reclaimed after seven idle days, and committed only by a trusted
 # successful run of the default branch: a pull request's build reads what the
 # default branch last kept and writes nothing back. The disk that is mounted for
-# you automatically, found through GHWARP_STICKY_DISK, is not replaced by this.
+# you automatically, found through RUNNERSIO_STICKY_DISK, is not replaced by this.
 #
 # WHAT HAPPENS THE FIRST TIME A KEY IS USED. The disks of a job are attached
 # before its first step runs, and the host cannot read your workflow to know
