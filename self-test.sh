@@ -172,6 +172,71 @@ run_action
 eq "no /opt/runnersio at all: exit 0" "$rc" 0
 has "no /opt/runnersio: not-ours" "$outtxt" "device-state=not-ours"
 
+# --- 2b. which hook directory: by the directory, never by the manifest file (RUN-4188) ----------
+# run_rooted <script>: like run_action, but names no manifest, so the script picks the directory itself under
+# GHWARP_STICKY_ROOT=$case_dir/root. The first v1.1.0 picked by the FILE and called an old-image runner with no
+# attached key "not ours" on a live runner (verifier-self-tests run 44291238604).
+run_rooted() {
+  local script="${1:-$here/stickydisk.sh}"
+  text="$(
+    env -i PATH="$bin:$PATH" HOME="$case_dir/home" FAKE_LOG="$case_dir/log" \
+      GITHUB_OUTPUT="$case_dir/out" RUNNER_TEMP="$case_dir/tmp" RUNNER_OS=Linux \
+      GHWARP_STICKY_ROOT="$case_dir/root" \
+      INPUT_KEY="$KEY" INPUT_PATH="$P" INPUT_FAIL_IF_UNAVAILABLE=false \
+      bash "$script" 2>&1
+  )"
+  rc=$?
+  logtxt="$(cat "$case_dir/log")"
+  outtxt="$(cat "$case_dir/out")"
+}
+# rooted_manifest <dir> <state>: one entry for $KEY in $case_dir/root/opt/<dir>/sticky-disks.json.
+rooted_manifest() {
+  local d
+  d="$(digest_of "$KEY")"
+  jq -cn --arg d "$d" --arg s "$2" '{disks: {($d): {n: 1, device: "/dev/vdc", state: $s, refusal: "", reason: ""}}}' \
+    >"$case_dir/root/opt/$1/sticky-disks.json"
+}
+
+new_case oldimg-nokey; P="$case_dir/mnt"; mkdir -p "$case_dir/root/opt/ghwarp"
+run_rooted
+eq "old image (/opt/ghwarp only), key not attached: exit 0" "$rc" 0
+has "  ...is OUR runner: not-attached-yet" "$outtxt" "device-state=not-attached-yet"
+hasnt "  ...and never not-ours" "$outtxt" "device-state=not-ours"
+
+new_case oldimg-key; P="$case_dir/mnt"; mkdir -p "$case_dir/root/opt/ghwarp"; rooted_manifest ghwarp refused
+run_rooted
+has "old image with an entry: the /opt/ghwarp manifest is read" "$outtxt" "device-state=refused"
+
+new_case newimg-nokey; P="$case_dir/mnt"; mkdir -p "$case_dir/root/opt/runnersio"
+run_rooted
+has "new image (/opt/runnersio), key not attached: not-attached-yet" "$outtxt" "device-state=not-attached-yet"
+
+new_case both-dirs; P="$case_dir/mnt"; mkdir -p "$case_dir/root/opt/runnersio" "$case_dir/root/opt/ghwarp"
+rooted_manifest ghwarp refused
+run_rooted
+has "both directories: /opt/runnersio wins, a stale /opt/ghwarp entry is not read" "$outtxt" "device-state=not-attached-yet"
+
+new_case neither-dir; P="$case_dir/mnt"; mkdir -p "$case_dir/root"
+run_rooted
+has "neither directory: not-ours" "$outtxt" "device-state=not-ours"
+
+# CONTROL: the file-keyed fallback of the first v1.1.0 must fail the old-image case above.
+mkdir -p "$work/mutant-file"
+python3 - "$here/stickydisk.sh" "$work/mutant-file/stickydisk.sh" <<'PY'
+import sys
+s = open(sys.argv[1]).read()
+s = s.replace('elif [ ! -d "$hook_root/opt/runnersio" ] && [ -d "$hook_root/opt/ghwarp" ]; then',
+              'elif [ ! -e "$hook_root/opt/runnersio/sticky-disks.json" ] && [ -e "$hook_root/opt/ghwarp/sticky-disks.json" ]; then')
+open(sys.argv[2], "w").write(s)
+PY
+if cmp -s "$here/stickydisk.sh" "$work/mutant-file/stickydisk.sh"; then
+  fail "CONTROL: the file-keyed mutation changed nothing, so the old-image case proves nothing"
+else
+  new_case oldimg-nokey-mutant; P="$case_dir/mnt"; mkdir -p "$case_dir/root/opt/ghwarp"
+  run_rooted "$work/mutant-file/stickydisk.sh"
+  has "CONTROL: keyed on the file, the old-image no-key case says not-ours (the case can fail)" "$outtxt" "device-state=not-ours"
+fi
+
 # --- 3. a key the host did not attach --------------------------------------------------
 new_case absent; P="$case_dir/mnt"
 run_action

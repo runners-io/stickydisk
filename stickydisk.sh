@@ -35,11 +35,18 @@
 set -uo pipefail
 
 # RUN-4188: the guest's hook directory is /opt/runnersio now (the runner prints its hook's path in every customer's
-# job log). An image built before that still writes /opt/ghwarp, so a manifest at the old place is read when there is
-# none at the new one. GHWARP_STICKY_MANIFEST is the test suite's way of naming either.
-manifest="${GHWARP_STICKY_MANIFEST:-/opt/runnersio/sticky-disks.json}"
-if [ -z "${GHWARP_STICKY_MANIFEST:-}" ] && [ ! -e "$manifest" ] && [ -e /opt/ghwarp/sticky-disks.json ]; then
-  manifest=/opt/ghwarp/sticky-disks.json
+# job log). An image built before that has /opt/ghwarp instead, so the fallback is chosen by which DIRECTORY exists,
+# never by whether the manifest file does: a job whose key is not attached has no manifest at all, and the first
+# v1.1.0 (2026-11-18, 11:28-11:36Z) fell through to the missing /opt/runnersio and called every such old-image runner
+# "not ours". GHWARP_STICKY_MANIFEST is the test suite's way of naming the file outright; GHWARP_STICKY_ROOT lets it
+# stand up either directory under a scratch root.
+hook_root="${GHWARP_STICKY_ROOT:-}"
+if [ -n "${GHWARP_STICKY_MANIFEST:-}" ]; then
+  manifest="$GHWARP_STICKY_MANIFEST"
+elif [ ! -d "$hook_root/opt/runnersio" ] && [ -d "$hook_root/opt/ghwarp" ]; then
+  manifest="$hook_root/opt/ghwarp/sticky-disks.json"
+else
+  manifest="$hook_root/opt/runnersio/sticky-disks.json"
 fi
 joblog_url_file="${GHWARP_JOBLOG_URL_FILE:-$(dirname "$manifest")/joblog-url}"
 
