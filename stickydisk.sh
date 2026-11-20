@@ -197,6 +197,46 @@ case "$state" in
     ;;
 esac
 
+# --- making a mount point ------------------------------------------------------------
+# RUN-4949: the mount point used to be made with a bare `sudo mkdir -p` and only the
+# mount point was chowned, so every folder the action had to make ABOVE it was left
+# owned by root, and the job's own user could not write next to its own disk. Probe run
+# 44698457888 (2026-11-20 07:59Z) showed it on a real job: a disk at
+# runner.temp/sd-parent-probe/inner gave parent_owner=root job_user=runner
+# parent_writable=no. A disk at ~/.cache/pip on a guest with no ~/.cache would lock every
+# other tool out of ~/.cache the same way.
+#
+# So the folders this makes, and ONLY those, are handed to the job's user, with the mode
+# the user's own `mkdir -p` would have given them (GNU mkdir -p makes a parent with the
+# umask's mode plus u+wx). A folder that already existed is never touched, whoever owns
+# it: the walk finds the first missing folder BEFORE mkdir and stops there, and nothing
+# is chowned recursively, so nothing on a mounted disk or above the walk is either. Each
+# chown is -h and only on a directory that is not a link, so a link that appears in a
+# made folder's place is never followed. The mount point itself is chowned after the
+# mount, as before, because the chown that counts is the one on the mounted disk's root.
+make_mount_point() { # make_mount_point <dir>
+  local want="$1" d top="" mode
+  while [ "${want%/}" != "$want" ]; do want="${want%/}"; done
+  d="$want"
+  while [ ! -e "$d" ] && [ ! -L "$d" ]; do top="$d"; d="$(dirname "$d")"; done
+  sudo mkdir -p "$want" || return 1
+  # Nothing was made, or only the mount point: there is no parent to hand over.
+  if [ -z "$top" ] || [ "$top" = "$want" ]; then return 0; fi
+  mode="$(printf '%o' $(( (0777 & ~0$(umask)) | 0300 )))"
+  d="$want"
+  while [ "$d" != "$top" ]; do
+    d="$(dirname "$d")"
+    if [ ! -d "$d" ] || [ -L "$d" ]; then
+      warn "${d} is no longer the folder this step made, so it was left as it is"
+      return 0
+    fi
+    if ! { sudo chown -h "$(id -u):$(id -g)" "$d" && sudo chmod "$mode" "$d"; }; then
+      warn "${d} was made for the disk at ${want} but could not be given to the job's user"
+    fi
+  done
+  return 0
+}
+
 # --- a revealed disk: mount it -----------------------------------------------------
 case "$n" in [1-5]) ;; *) finish_cold unavailable "the sticky disk for key ${key} has no usable slot number. The job runs without it." ;; esac
 dev_re='^/dev/[A-Za-z0-9]+$'
@@ -205,7 +245,7 @@ dev_re='^/dev/[A-Za-z0-9]+$'
 # The same key a second time: one disk, bound to the second path.
 if [ -n "$seen_dir" ] && [ -s "$seen_dir/$digest" ]; then
   first="$(head -n 1 "$seen_dir/$digest")"
-  if sudo mkdir -p "$path" && sudo mount --bind "$first" "$path"; then
+  if make_mount_point "$path" && sudo mount --bind "$first" "$path"; then
     say "key ${key} is already mounted at ${first}; bound it at ${path} too"
     out mounted true
     out device-state mounted
@@ -233,7 +273,7 @@ fi
 
 # noinit_itable, and the disk mounted without it rather than not at all (RUN-1029).
 mounted=0
-if sudo mkdir -p "$path"; then
+if make_mount_point "$path"; then
   if sudo mount -o noinit_itable "$device" "$path"; then
     mounted=1
   elif sudo mount "$device" "$path"; then

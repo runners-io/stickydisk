@@ -13,6 +13,14 @@
 # filesystem" from blkid -p (exit 2). Case "blkid cannot decide" holds it, and the
 # mutation check at the end removes the guard from a copy of the script and
 # requires that same case to go red, so the case is shown able to fail.
+#
+# WHO OWNS WHAT, WITHOUT ROOT (RUN-4949). This runs as an ordinary user, so a fake
+# sudo cannot make anything root's. Instead the fake sudo marks what it runs as
+# root's, the fake mkdir writes every folder it makes under that mark into a ledger
+# as root:root, and the fake chown writes the owner it was asked for. owner_of reads
+# the ledger. The modes are real: the fake sudo runs with sudo's own umask (the
+# user's, OR'd with 0022), so a folder sudo made carries sudo's mode until the
+# script sets it.
 
 # The single-quoted $ below are deliberate: the metacharacter cases are literal
 # text for the script under test.
@@ -36,10 +44,53 @@ command -v jq >/dev/null 2>&1 || { echo "self-test needs jq"; exit 2; }
 # --- the fakes ------------------------------------------------------------------
 bin="$work/bin"
 mkdir -p "$bin"
-for t in sudo blkid mkfs.ext4 mount chown curl blockdev; do
+real_mkdir="$(command -v mkdir)"
+for t in sudo blkid mkfs.ext4 mount chown curl blockdev mkdir; do
   case "$t" in
     sudo)
-      printf '#!/usr/bin/env bash\nexec "$@"\n' >"$bin/$t" ;;
+      # sudo's default umask is the user's OR'd with 0022 (sudoers' umask, no umask_override).
+      cat >"$bin/$t" <<'EOF'
+#!/usr/bin/env bash
+umask "$(printf '%04o' $(( 0$(umask) | 0022 )))"
+export FAKE_AS_ROOT=1
+exec "$@"
+EOF
+      ;;
+    mkdir)
+      # Under the fake sudo, every folder this call makes is written to the ledger as root's.
+      cat >"$bin/$t" <<EOF
+#!/usr/bin/env bash
+real="$real_mkdir"
+EOF
+      cat >>"$bin/$t" <<'EOF'
+if [ -z "${FAKE_AS_ROOT:-}" ] || [ -z "${FAKE_OWNERS:-}" ]; then exec "$real" "$@"; fi
+made=()
+for a in "$@"; do
+  case "$a" in -*) continue ;; esac
+  d="$a"
+  while [ "${d%/}" != "$d" ]; do d="${d%/}"; done
+  while [ ! -e "$d" ] && [ ! -L "$d" ]; do made+=("$d"); d="$(dirname "$d")"; done
+done
+"$real" "$@" || exit $?
+for d in "${made[@]}"; do echo "root:root $d" >>"$FAKE_OWNERS"; done
+exit 0
+EOF
+      ;;
+    chown)
+      # Logs every call; under the fake sudo, writes the owner it was asked for to the ledger.
+      cat >"$bin/$t" <<'EOF'
+#!/usr/bin/env bash
+echo "chown $*" >>"$FAKE_LOG"
+if [ -n "${FAKE_AS_ROOT:-}" ] && [ -n "${FAKE_OWNERS:-}" ]; then
+  owner=""
+  for a in "$@"; do
+    case "$a" in -*) continue ;; esac
+    if [ -z "$owner" ]; then owner="$a"; else echo "$owner $a" >>"$FAKE_OWNERS"; fi
+  done
+fi
+exit 0
+EOF
+      ;;
     blkid)
       # FAKE_BLKID_RC: 0 with TYPE=ext4 (formatted), 2 (nothing there), 1 (could not decide).
       cat >"$bin/$t" <<'EOF'
@@ -93,6 +144,7 @@ new_case() {
   mkdir -p "$case_dir/opt" "$case_dir/tmp" "$case_dir/home"
   : >"$case_dir/log"
   : >"$case_dir/out"
+  : >"$case_dir/owners"
   printf 'https://cache-gra1.example.test:8443/ghwarp/joblog' >"$case_dir/opt/joblog-url"
 }
 
@@ -108,8 +160,9 @@ write_manifest() {
 run_action() {
   local script="${1:-$here/stickydisk.sh}"
   text="$(
+    umask "${UMASK_T:-$(umask)}"
     env -i PATH="$bin:$PATH" HOME="$case_dir/home" \
-      FAKE_LOG="$case_dir/log" \
+      FAKE_LOG="$case_dir/log" FAKE_OWNERS="$case_dir/owners" \
       GITHUB_OUTPUT="$case_dir/out" RUNNER_TEMP="$case_dir/tmp" RUNNER_OS="${RUNNER_OS_T:-Linux}" \
       ${RUNNER_ENV_T:+RUNNER_ENVIRONMENT="$RUNNER_ENV_T"} \
       GHWARP_STICKY_MANIFEST="$case_dir/opt/sticky-disks.json" \
@@ -125,7 +178,12 @@ run_action() {
   logtxt="$(cat "$case_dir/log")"
   outtxt="$(cat "$case_dir/out")"
 }
-reset_env() { unset RUNNER_OS_T RUNNER_ENV_T FAKE_BLKID_RC_T FAKE_MOUNT_NOINIT_FAILS_T FAKE_MOUNT_FAILS_T FAKE_CURL_RC_T STRICT; }
+reset_env() { unset RUNNER_OS_T RUNNER_ENV_T FAKE_BLKID_RC_T FAKE_MOUNT_NOINIT_FAILS_T FAKE_MOUNT_FAILS_T FAKE_CURL_RC_T STRICT UMASK_T; }
+
+# owner_of <dir>: the last owner the ledger gives it, or "unrecorded" (made by this test, as itself).
+owner_of() { awk -v p="$1" '$2 == p { o = $1 } END { print (o == "" ? "unrecorded" : o) }' "$case_dir/owners"; }
+mode_of() { python3 -c 'import os, sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o7777)[2:])' "$1"; }
+me="$(id -u):$(id -g)"
 
 KEY='acme/app-npm'
 reset_env
@@ -361,6 +419,67 @@ P="$case_dir/two"; run_action
 eq "the same key at a second path: exit 0" "$rc" 0
 has "the same key at a second path: bound, not mounted twice" "$logtxt" "mount --bind $case_dir/one $case_dir/two"
 eq "the same key at a second path: the device is mounted once" "$(grep -c '^mount -o noinit_itable /dev/vdc' <<<"$logtxt")" 1
+
+# --- 7b. a folder the action had to make above the mount point (RUN-4949) -------------------------
+# Probe run 44698457888 (2026-11-20 07:59Z): a disk at runner.temp/sd-parent-probe/inner left
+# sd-parent-probe owned by root, and the job's user could not write in it. Every folder the action
+# MAKES goes to the job's user, with the mode the user's own `mkdir -p` would give it; a folder that
+# already existed is never touched. umask 0002 because there the two modes differ: sudo's umask is
+# 0022, so a folder sudo made is 755 where the user's own mkdir -p makes 775.
+ref="$work/umask-ref"
+(umask 0002 && mkdir -p "$ref/parent/child")
+want_mode="$(mode_of "$ref/parent")"
+
+parent_case() { # parent_case <script>
+  new_case parent; write_manifest revealed
+  P="$case_dir/tmp/sd-parent-probe/deeper/inner"
+  UMASK_T=0002 run_action "$1"; reset_env
+}
+parent_case "$here/stickydisk.sh"
+eq "a missing parent: exit 0" "$rc" 0
+has "a missing parent: mounted" "$outtxt" "mounted=true"
+for d in "$case_dir/tmp/sd-parent-probe" "$case_dir/tmp/sd-parent-probe/deeper"; do
+  eq "a folder the action made (${d#"$case_dir"/}) is the job user's" "$(owner_of "$d")" "$me"
+  eq "  ...with the mode the user's own mkdir -p gives it" "$(mode_of "$d")" "$want_mode"
+done
+has "a missing parent: the mount point is still the job user's" "$logtxt" "chown $me $P"
+eq "a folder that was already there (RUNNER_TEMP) is never chowned" "$(grep -cE "^chown .* $case_dir/tmp\$" <<<"$logtxt")" 0
+
+# CONTROL: an ancestor that already existed, root's, stays root's, and keeps its mode.
+new_case rootowned; write_manifest revealed
+mkdir -p "$case_dir/root-owned"; chmod 0755 "$case_dir/root-owned"
+echo "root:root $case_dir/root-owned" >>"$case_dir/owners"
+P="$case_dir/root-owned/made/inner"
+UMASK_T=0002 run_action; reset_env
+has "under a root-owned folder: mounted" "$outtxt" "mounted=true"
+eq "CONTROL: a root-owned folder that already existed stays root's" "$(owner_of "$case_dir/root-owned")" "root:root"
+eq "CONTROL:   ...and keeps its mode" "$(mode_of "$case_dir/root-owned")" "755"
+eq "CONTROL:   ...and is never named to chown" "$(grep -cE "^chown .* $case_dir/root-owned\$" <<<"$logtxt")" 0
+eq "  ...while the folder made below it is the job user's" "$(owner_of "$case_dir/root-owned/made")" "$me"
+
+new_case existing-parent; write_manifest revealed; mkdir -p "$case_dir/there"; P="$case_dir/there/inner"
+UMASK_T=0002 run_action; reset_env
+has "an existing parent: mounted" "$outtxt" "mounted=true"
+hasnt "an existing parent: nothing but the mount point is chowned" "$logtxt" "chown -h"
+
+# The same key at a second path, under a missing parent: the bind makes its folders the same way.
+new_case twice-parent; write_manifest revealed
+P="$case_dir/one"; run_action
+P="$case_dir/two-parent/two"; UMASK_T=0002 run_action; reset_env
+has "the second path of a key, under a missing parent: bound" "$logtxt" "mount --bind $case_dir/one $case_dir/two-parent/two"
+eq "  ...and the parent it made is the job user's" "$(owner_of "$case_dir/two-parent")" "$me"
+
+# CONTROL: the old `sudo mkdir -p "$path"`, back in a copy, must leave the made folder root's.
+mutp="$work/mutant-parent"
+mkdir -p "$mutp"
+sed 's/make_mount_point "\$path"/sudo mkdir -p "$path"/' "$here/stickydisk.sh" >"$mutp/stickydisk.sh"
+if cmp -s "$here/stickydisk.sh" "$mutp/stickydisk.sh"; then
+  fail "CONTROL: the parent-folder mutation changed nothing, so the parent case proves nothing"
+else
+  parent_case "$mutp/stickydisk.sh"
+  eq "CONTROL: with the old sudo mkdir -p, the made folder is root's (the parent case can fail)" \
+    "$(owner_of "$case_dir/tmp/sd-parent-probe")" "root:root"
+fi
 
 # --- 8. the check on the check -------------------------------------------------------------------
 # Remove the positive-"no filesystem" guard from a COPY of the script, so that any
